@@ -12,6 +12,7 @@ import type { Verification } from "@tinfoilsh/verifier";
 import { AttestationError, stripCategory } from "../../errors.js";
 import type { Fetch, TransportMode } from "../../options.js";
 import type { Enclave } from "../enclave.js";
+import { asVerification, isSealChecked, type Attested } from "../sealcheck.js";
 import { VerifiedEnclave, type State } from "../verified.js";
 import { requestURL } from "./origin.js";
 
@@ -101,7 +102,7 @@ export interface Mode {
    * those keys, detected before the application processes the request, are
    * {@link PeerLacksKeyError}s.
    */
-  bind(v: Verification): BoundFetch | Promise<BoundFetch>;
+  bind(v: Attested): BoundFetch | Promise<BoundFetch>;
 }
 
 /**
@@ -134,7 +135,7 @@ export function isKeyRejection(err: unknown): boolean {
 
 export class KeyedTransport {
   readonly #mode: Mode;
-  readonly #cache: VerifiedEnclave<BoundFetch>;
+  readonly #cache: VerifiedEnclave<BoundFetch, Attested>;
   #closed = false;
   /** Bindings retired while the transport was open: a request may still be in flight on one, so each is closed outright when the transport closes. */
   readonly #retired = new Set<BoundFetch>();
@@ -143,7 +144,7 @@ export class KeyedTransport {
 
   constructor(enclave: Enclave, mode: Mode, clock: () => Date = () => new Date()) {
     this.#mode = mode;
-    this.#cache = new VerifiedEnclave<BoundFetch>(enclave, (v) => mode.bind(v), clock, (bound) => this.#release(bound));
+    this.#cache = new VerifiedEnclave<BoundFetch, Attested>(enclave, (v) => mode.bind(v), clock, (bound) => this.#release(bound));
     this.fetch = (input, init) => this.#send(input, init);
   }
 
@@ -165,7 +166,7 @@ export class KeyedTransport {
   async #send(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     // Validate first, so a request the mode can't protect never triggers a verification.
     this.#mode.validateRequest(shapeOf(input, init));
-    const state = await this.#cache.ensureVerified(signalOf(input, init));
+    const state = await this.#cache.claim(signalOf(input, init));
     try {
       return await state.bound.fetch(input, init);
     } catch (err) {
@@ -185,24 +186,30 @@ export class KeyedTransport {
     return this.#cache.enclave();
   }
 
-  /** A verification valid now, verifying first only if needed; success means requests can be sent. */
+  /**
+   * A verification valid now, verifying first only if needed; success means
+   * requests can be sent. With a seal check, which has no verification to
+   * return, it verifies and then rejects with a configuration error; use
+   * {@link state} to verify without one.
+   */
   async ensureVerified(signal?: AbortSignal): Promise<Verification> {
-    return (await this.#cache.ensureVerified(signal)).verification;
+    return asVerification((await this.#cache.ensureVerified(signal)).verification);
   }
 
   /** Verifies again even if the current verification is still valid. */
   async reverify(signal?: AbortSignal): Promise<Verification> {
-    return (await this.#cache.reverify(signal)).verification;
+    return asVerification((await this.#cache.reverify(signal)).verification);
   }
 
   /** Verifies like {@link reverify} but without the retry. */
   async verifyOnce(signal?: AbortSignal): Promise<Verification> {
-    return (await this.#cache.verifyOnce(signal)).verification;
+    return asVerification((await this.#cache.verifyOnce(signal)).verification);
   }
 
-  /** The last successful verification, unchecked. */
+  /** The last successful verification, unchecked; undefined for a seal check's. */
   current(): Verification | undefined {
-    return this.#cache.current();
+    const v = this.#cache.current();
+    return v === undefined || isSealChecked(v) ? undefined : v;
   }
 
   /** The state a request is sent under, for layers that need the bound fetch itself. */

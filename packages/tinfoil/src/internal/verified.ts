@@ -5,29 +5,38 @@
  * its keys, so a request never sends under keys other than those of the
  * verification it checked. Concurrent callers share one verification,
  * including its failure. No network I/O happens until the first request or
- * `ensureVerified`.
+ * `ensureVerified`. For a single-use enclave (a seal check), each request
+ * claims a verification of its own instead.
  */
-import type { Verification } from "@tinfoilsh/verifier";
 import { AttestationError } from "../errors.js";
 import { closedError } from "./dispose.js";
 import { Enclave, FRESHNESS_EXPIRED, freshAt } from "./enclave.js";
+import type { Verification } from "@tinfoilsh/verifier";
+import type { Attested } from "./sealcheck.js";
 
 /** One successful verification and what the transport bound to its keys. */
-export interface State<T> {
-  readonly verification: Verification;
+export interface State<T, V extends Attested = Attested> {
+  readonly verification: V;
   readonly bound: T;
 }
 
-interface Entry<T> extends State<T> {
+interface Entry<T, V extends Attested> extends State<T, V> {
   rejected: boolean;
+  /** Set once a request has been sent under a single-use state, so no other request reuses it. */
+  claimed: boolean;
 }
 
-export class VerifiedEnclave<T = void> {
+/**
+ * `V` is what the enclave's verifications are: {@link Attested} for an
+ * enclave that may have a seal check, or {@link Verification}, the default,
+ * for one that can't.
+ */
+export class VerifiedEnclave<T = void, V extends Attested = Verification> {
   readonly #enclave: Enclave;
-  readonly #bind: (v: Verification) => T | Promise<T>;
+  readonly #bind: (v: V) => T | Promise<T>;
   readonly #release: (bound: T) => void;
   readonly #clock: () => Date;
-  #current: Entry<T> | undefined;
+  #current: Entry<T, V> | undefined;
   /** The refresh in flight, shared by every caller that needs one. */
   #refreshing: Promise<void> | undefined;
   #closed = false;
@@ -38,7 +47,7 @@ export class VerifiedEnclave<T = void> {
    * called with a binding once its state is replaced or found expired, so
    * connections tied to retired keys are closed.
    */
-  constructor(enclave: Enclave, bind: (v: Verification) => T | Promise<T>, clock: () => Date = () => new Date(), release: (bound: T) => void = () => {}) {
+  constructor(enclave: Enclave, bind: (v: V) => T | Promise<T>, clock: () => Date = () => new Date(), release: (bound: T) => void = () => {}) {
     this.#enclave = enclave;
     this.#bind = bind;
     this.#clock = clock;
@@ -50,27 +59,37 @@ export class VerifiedEnclave<T = void> {
   }
 
   /** A state valid now, verifying first only if the current one has expired or been invalidated. */
-  ensureVerified(signal?: AbortSignal): Promise<State<T>> {
-    return this.#verified(signal, false, (e) => e.verify());
+  ensureVerified(signal?: AbortSignal): Promise<State<T, V>> {
+    return this.#verified(signal, false, false, (e) => e.attest());
+  }
+
+  /**
+   * As {@link ensureVerified}, for a request about to be sent under the
+   * state. For a single-use enclave, the state is claimed, and a claimed
+   * state is never returned again, so each request gets a verification of
+   * its own.
+   */
+  claim(signal?: AbortSignal): Promise<State<T, V>> {
+    return this.#verified(signal, false, true, (e) => e.attest());
   }
 
   /** Verifies again even if the current verification is still valid. */
-  reverify(signal?: AbortSignal): Promise<State<T>> {
-    return this.#verified(signal, true, (e) => e.verify());
+  reverify(signal?: AbortSignal): Promise<State<T, V>> {
+    return this.#verified(signal, true, false, (e) => e.attest());
   }
 
   /** Verifies like {@link reverify} but without the retry, so a caller trying several enclaves moves on quickly. */
-  verifyOnce(signal?: AbortSignal): Promise<State<T>> {
-    return this.#verified(signal, true, (e) => e.verifyOnce());
+  verifyOnce(signal?: AbortSignal): Promise<State<T, V>> {
+    return this.#verified(signal, true, false, (e) => e.attestOnce());
   }
 
   /** The last successful verification without checking it, or undefined before the first. */
-  current(): Verification | undefined {
+  current(): V | undefined {
     return this.#current?.verification;
   }
 
   /** Marks the state a request was sent under rejected, so the next request verifies again; a replaced state leaves the current one valid. */
-  invalidate(state: State<T>): void {
+  invalidate(state: State<T, V>): void {
     if (this.#current !== undefined && this.#current.verification === state.verification) this.#current.rejected = true;
   }
 
@@ -86,16 +105,20 @@ export class VerifiedEnclave<T = void> {
     if (this.#current !== undefined) this.#release(this.#current.bound);
   }
 
-  #valid(entry: Entry<T>): boolean {
+  #valid(entry: Entry<T, V>): boolean {
     return !entry.rejected && freshAt(entry.verification, this.#clock());
   }
 
-  async #verified(signal: AbortSignal | undefined, force: boolean, verify: (e: Enclave) => Promise<Verification>): Promise<State<T>> {
+  async #verified(signal: AbortSignal | undefined, force: boolean, claim: boolean, verify: (e: Enclave) => Promise<Attested>): Promise<State<T, V>> {
+    const single = this.#enclave.singleUse();
     for (;;) {
       if (this.#closed) throw closedError();
       signal?.throwIfAborted();
       const current = this.#current;
-      if (current !== undefined && this.#valid(current) && !force) return current;
+      if (current !== undefined && this.#valid(current) && !force && !(single && current.claimed)) {
+        if (single && claim) current.claimed = true;
+        return current;
+      }
       // A caller's cancellation does not abort a refresh other callers need,
       // so the refresh runs without the signal; the caller stops waiting.
       // That holds for a one-shot probe too: its fetch is bounded by its
@@ -112,10 +135,11 @@ export class VerifiedEnclave<T = void> {
   }
 
   /** Verifies the enclave and publishes the result as the current state. */
-  async #refresh(verify: (e: Enclave) => Promise<Verification>): Promise<void> {
-    const verification = await verify(this.#enclave);
+  async #refresh(verify: (e: Enclave) => Promise<Attested>): Promise<void> {
+    // Only an enclave with a seal check makes anything but a Verification, and V admits that for one.
+    const verification = (await verify(this.#enclave)) as V;
     const bound = await this.#bind(verification);
-    const entry: Entry<T> = { verification, bound, rejected: false };
+    const entry: Entry<T, V> = { verification, bound, rejected: false, claimed: false };
     // A close during the refresh already released the current binding; this one is not published.
     if (this.#closed) {
       this.#release(bound);

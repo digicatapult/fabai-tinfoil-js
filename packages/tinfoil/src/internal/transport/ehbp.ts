@@ -11,9 +11,9 @@
  * to the caller, or, in a browser, which hides where it leads, failed too.
  * This mode works wherever fetch does, browsers included.
  */
-import type { Verification } from "@tinfoilsh/verifier";
 import { Identity, PROTOCOL, type RequestContext } from "ehbp";
 import { AttestationError, ConfigurationError, messageOf, NetworkError, TinfoilError } from "../../errors.js";
+import type { Attested } from "../sealcheck.js";
 import type { Fetch } from "../../options.js";
 import { isLoopback } from "./base-url.js";
 import { noFollow, PeerLacksKeyError, shapeOf, type BoundFetch, type Mode, type RequestShape } from "./transport.js";
@@ -69,7 +69,7 @@ export function ehbpMode(options: EHBPOptions = {}): Mode {
   return {
     name: "ehbp",
     validateRequest: checkEHBP,
-    async bind(v: Verification): Promise<BoundFetch> {
+    async bind(v: Attested): Promise<BoundFetch> {
       const key = v.hpkePublicKey;
       if (key === undefined) throw new AttestationError("document endorses no HPKE key; cannot use the EHBP transport mode (use the TLS transport mode)");
       let identity: Identity;

@@ -1,0 +1,86 @@
+# Releases the patched `tinfoil` package as a tarball on a GitHub release,
+# not on npm: the `tinfoil` and `@tinfoilsh/verifier` names are Tinfoil's.
+# `@tinfoilsh/verifier` is unchanged, so the tarball depends on Tinfoil's
+# published 2.0.0-rc.4 from npm. A kiosk installs the tarball by its URL,
+# and its lockfile records the tarball's integrity hash.
+#
+# Tag vX.Y.Z[-pre].fabai.N on a fabai/* branch; the tag is the package
+# version. Upstream's "Release" workflow, which also runs on v* tags, is
+# disabled in the repository's settings.
+name: FabAI release
+
+on:
+  push:
+    tags:
+      - "v*.fabai.*"
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\.fabai\.[0-9]+)$ ]]; then
+            echo "::error::tag $TAG isn't vX.Y.Z[-pre].fabai.N"
+            exit 1
+          fi
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - name: Only FabAI's patches differ from upstream
+        run: scripts/check-fabai-diff.sh --upstream
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          # Disable caching in release flows to avoid cache poisoning supply chain attacks
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set the package version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: npm version "$VERSION" --workspace tinfoil --no-git-tag-version --no-workspaces-update
+
+      # The build generates SDK_VERSION from the package version set above.
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm pack --workspace tinfoil
+          sha256sum "tinfoil-$VERSION.tgz" > SHA256SUMS
+
+      - name: Attest the tarball
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: tinfoil-${{ steps.version.outputs.version }}.tgz
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "$TAG" --verify-tag --prerelease --latest=false --generate-notes "tinfoil-$VERSION.tgz" SHA256SUMS

@@ -20,8 +20,9 @@ import {
   type Verification,
 } from "@tinfoilsh/verifier";
 import { AttestationError, ConfigurationError, messageOf, NetworkError, stripCategory, TinfoilError, withMessage } from "../errors.js";
-import type { Fetch, VerificationCheck } from "../options.js";
+import type { Fetch, SealCheck, VerificationCheck } from "../options.js";
 import { fetchDocument } from "./fetch.js";
+import { asVerification, isSealChecked, runSealCheck, type Attested } from "./sealcheck.js";
 
 export const VERIFICATION_RETRIES = 1;
 export const VERIFICATION_RETRY_DELAY_MS = 1_000;
@@ -41,6 +42,13 @@ export interface EnclaveConfig {
   readonly verifier?: Verifier;
   /** Called with each verification that passes the verifier; a throw rejects it without a retry. */
   readonly verificationCheck?: VerificationCheck;
+  /**
+   * When set, checks the enclave in place of fetching a document and
+   * verifying it: `pin` and `verifier` are unused, and `verificationCheck`
+   * must be unset. Each of its results protects one request (see
+   * {@link Enclave.singleUse}).
+   */
+  readonly sealCheck?: SealCheck;
   /** Seams for tests: the fetch used for documents, the clock, the nonce source and the retry delay. */
   readonly fetch?: Fetch;
   readonly clock?: () => Date;
@@ -48,10 +56,10 @@ export interface EnclaveConfig {
   readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
-/** A verification check's rejection: a decision about the evidence, so it is not retried. */
+/** A verification check's rejection, or a seal check's: a decision about the evidence, so it is not retried. */
 export class RejectedError extends AttestationError {
-  constructor(host: string, cause: unknown) {
-    super(`verification check rejected ${host}: ${messageOf(cause)}`, { cause });
+  constructor(host: string, cause: unknown, check = "verification check") {
+    super(`${check} rejected ${host}: ${messageOf(cause)}`, { cause });
     this.name = "RejectedError";
   }
 }
@@ -60,19 +68,21 @@ export class Enclave {
   readonly #host: string;
   readonly #relay: string | undefined;
   readonly #pin: Required<Pin>;
-  readonly #verifier: Verifier;
+  readonly #verifier: Verifier | undefined;
   readonly #check: VerificationCheck | undefined;
+  readonly #sealCheck: SealCheck | undefined;
   readonly #fetch: Fetch;
   readonly #clock: () => Date;
   readonly #nonce: () => Uint8Array;
   readonly #sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
-  private constructor(config: EnclaveConfig, verifier: Verifier) {
+  private constructor(config: EnclaveConfig, verifier: Verifier | undefined) {
     this.#host = config.host;
     this.#relay = config.relay;
     this.#pin = Object.freeze({ repo: config.pin.repo ?? "", project: config.pin.project ?? "" });
     this.#verifier = verifier;
     this.#check = config.verificationCheck;
+    this.#sealCheck = config.sealCheck;
     this.#fetch = config.fetch ?? ((input, init) => fetch(input, init));
     this.#clock = config.clock ?? (() => new Date());
     this.#nonce = config.nonce ?? randomNonce;
@@ -82,6 +92,10 @@ export class Enclave {
   /** Checks the pin against the verifier's rules; no network I/O. */
   static async create(config: EnclaveConfig): Promise<Enclave> {
     if (config.host === "") throw new ConfigurationError("enclave host is required");
+    if (config.sealCheck !== undefined) {
+      if (config.verificationCheck !== undefined) throw new ConfigurationError("a seal check replaces the verification check: set one");
+      return new Enclave(config, undefined);
+    }
     try {
       const verifier = config.verifier ?? (await Verifier.create());
       verifier.checkPinVerifiability(config.pin);
@@ -100,22 +114,37 @@ export class Enclave {
     return this.#pin;
   }
 
-  /** The verification policy, which several enclaves can share. */
-  verifier(): Verifier {
+  /** The verification policy, which several enclaves can share; undefined with a seal check. */
+  verifier(): Verifier | undefined {
     return this.#verifier;
   }
 
+  /** Whether each verification may protect only one request: true with a seal check, which releases its key for a single send. */
+  singleUse(): boolean {
+    return this.#sealCheck !== undefined;
+  }
+
   /** Fetches and verifies the enclave's attestation, retrying once after a network or attestation failure. */
-  verify(signal?: AbortSignal): Promise<Verification> {
-    return this.#verify(VERIFICATION_RETRIES, signal);
+  async verify(signal?: AbortSignal): Promise<Verification> {
+    return asVerification(await this.attest(signal));
   }
 
   /** Verifies like {@link verify} but doesn't retry, so a caller trying several enclaves moves on quickly. */
-  verifyOnce(signal?: AbortSignal): Promise<Verification> {
+  async verifyOnce(signal?: AbortSignal): Promise<Verification> {
+    return asVerification(await this.attestOnce(signal));
+  }
+
+  /** As {@link verify}, or runs the seal check, whose result isn't a {@link Verification}. */
+  attest(signal?: AbortSignal): Promise<Attested> {
+    return this.#verify(VERIFICATION_RETRIES, signal);
+  }
+
+  /** As {@link attest}, without the retry. */
+  attestOnce(signal?: AbortSignal): Promise<Attested> {
     return this.#verify(0, signal);
   }
 
-  async #verify(retries: number, signal: AbortSignal | undefined): Promise<Verification> {
+  async #verify(retries: number, signal: AbortSignal | undefined): Promise<Attested> {
     let firstErr: TinfoilError | undefined;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
@@ -143,12 +172,21 @@ export class Enclave {
     }
   }
 
-  async #fetchVerification(signal: AbortSignal | undefined): Promise<Verification> {
+  async #fetchVerification(signal: AbortSignal | undefined): Promise<Attested> {
+    if (this.#sealCheck !== undefined) {
+      try {
+        return await runSealCheck(this.#sealCheck, this.#host, this.#relay, this.#clock(), signal);
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        // A refusal is a decision about the replica, so it isn't retried.
+        throw new RejectedError(this.#host, err, "seal check");
+      }
+    }
     const nonce = this.#nonce();
     const doc = await fetchDocument(this.#host, this.#relay, nonce, this.#fetch, signal);
     let verified: Verification;
     try {
-      verified = await this.#verifier.verifyV3At(doc, nonce, this.#pin, this.#clock());
+      verified = await this.#verifier!.verifyV3At(doc, nonce, this.#pin, this.#clock());
     } catch (err) {
       throw fromVerify(err);
     }
@@ -156,15 +194,16 @@ export class Enclave {
     return verified;
   }
 
-  #checkFreshness(v: Verification): void {
+  #checkFreshness(v: Attested): void {
     const expiresAt = v.freshnessExpiresAt;
     if (expiresAt === undefined || !(this.#clock().getTime() < expiresAt.getTime())) {
       throw new AttestationError(FRESHNESS_EXPIRED);
     }
   }
 
-  async #checkVerification(v: Verification): Promise<void> {
-    if (this.#check === undefined) return;
+  async #checkVerification(v: Attested): Promise<void> {
+    // create refuses a verification check alongside a seal check.
+    if (this.#check === undefined || isSealChecked(v)) return;
     try {
       await this.#check(v);
     } catch (err) {
@@ -174,7 +213,7 @@ export class Enclave {
 }
 
 /** Whether a verification valid at `now` is still inside its freshness window. */
-export function freshAt(v: Verification, now: Date): boolean {
+export function freshAt(v: Attested, now: Date): boolean {
   const expiresAt = v.freshnessExpiresAt;
   return expiresAt !== undefined && now.getTime() < expiresAt.getTime();
 }

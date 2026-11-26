@@ -26,7 +26,7 @@ export const TRUSTED_REPO_OWNER = "tinfoilsh/";
  *
  * @experimental The gateway route is new; this API may change without a major version.
  */
-export async function fetchCatalogWith(host: string, fetchImpl: Fetch, signal?: AbortSignal): Promise<Catalog> {
+export async function fetchCatalogWith(host: string, fetchImpl: Fetch, signal?: AbortSignal, owner = TRUSTED_REPO_OWNER): Promise<Catalog> {
   if (!isAuthority(host)) throw new ConfigurationError(`invalid gateway host ${JSON.stringify(host)}: want a host with an optional port`);
   const url = `https://${host}${CATALOG_PATH}`;
   let response: Response;
@@ -47,15 +47,15 @@ export async function fetchCatalogWith(host: string, fetchImpl: Fetch, signal?: 
     if (err instanceof TinfoilError || signal?.aborted) throw err;
     throw new NetworkError(`reading gateway catalog: ${messageOf(err)}`, { cause: err });
   }
-  return parseCatalog(body);
+  return parseCatalog(body, owner);
 }
 
 /**
- * Decodes a catalog's JSON, keeping the trusted entries; a malformed document is a {@link NetworkError}.
+ * Decodes a catalog's JSON, keeping the entries trusted for `owner`, which ends in a slash; a malformed document is a {@link NetworkError}.
  *
  * @experimental The gateway route is new; this API may change without a major version.
  */
-export function parseCatalog(body: Uint8Array): Catalog {
+export function parseCatalog(body: Uint8Array, owner = TRUSTED_REPO_OWNER): Catalog {
   let decoded: unknown;
   try {
     decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
@@ -70,7 +70,7 @@ export function parseCatalog(body: Uint8Array): Catalog {
     if (model === "") continue;
     const entry = catalogEntry(value);
     if (entry === undefined) throw new NetworkError(`decoding gateway catalog: model ${JSON.stringify(model)} has a malformed entry`);
-    if (trusted(entry)) catalog.set(model, entry);
+    if (trusted(entry, owner)) catalog.set(model, entry);
   }
   return catalog;
 }
@@ -87,15 +87,15 @@ function catalogEntry(value: unknown): CatalogEntry | undefined {
 }
 
 /**
- * Whether an entry names a bare repository of the trusted owner and at least one replica.
+ * Whether an entry names a bare repository of the trusted owner, which ends in a slash, and at least one replica.
  *
  * @experimental The gateway route is new; this API may change without a major version.
  */
-export function trusted(entry: CatalogEntry | undefined): entry is CatalogEntry {
+export function trusted(entry: CatalogEntry | undefined, owner = TRUSTED_REPO_OWNER): entry is CatalogEntry {
   if (entry === undefined) return false;
   try {
     const ref = parseReference(entry.repo);
-    return ref.repo === entry.repo && entry.repo.startsWith(TRUSTED_REPO_OWNER) && entry.hosts.length > 0;
+    return ref.repo === entry.repo && entry.repo.startsWith(owner) && entry.hosts.length > 0;
   } catch {
     return false;
   }

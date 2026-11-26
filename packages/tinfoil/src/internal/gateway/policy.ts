@@ -40,15 +40,18 @@ export class GatewayPolicy {
   readonly #pins: ReadonlyMap<string, ResolvedPin>;
   readonly #pinnedOnly: boolean;
   readonly #verifier: Verifier;
+  /** The repository owner, ending in a slash. */
+  readonly #owner: string;
 
-  private constructor(pins: ReadonlyMap<string, ResolvedPin>, pinnedOnly: boolean, verifier: Verifier) {
+  private constructor(pins: ReadonlyMap<string, ResolvedPin>, pinnedOnly: boolean, verifier: Verifier, owner: string) {
     this.#pins = pins;
     this.#pinnedOnly = pinnedOnly;
     this.#verifier = verifier;
+    this.#owner = owner;
   }
 
-  /** Checks the pins and the policies; every failure is a {@link ConfigurationError}. */
-  static async create(modelPins: ReadonlyMap<string, ModelPin> | undefined, pinnedOnly: boolean, verifier: Verifier | undefined): Promise<GatewayPolicy> {
+  /** Checks the pins, which must name repositories of `owner` (ending in a slash), and the policies; every failure is a {@link ConfigurationError}. */
+  static async create(modelPins: ReadonlyMap<string, ModelPin> | undefined, pinnedOnly: boolean, verifier: Verifier | undefined, owner = TRUSTED_REPO_OWNER): Promise<GatewayPolicy> {
     const pins = modelPins ?? new Map<string, ModelPin>();
     if (pinnedOnly && pins.size === 0) throw new ConfigurationError("pinned-only mode requires at least one model pin");
     if (verifier === undefined) {
@@ -62,8 +65,8 @@ export class GatewayPolicy {
     const resolved = new Map<string, ResolvedPin>();
     for (const [model, pin] of pins) {
       if (pin.verifier?.callerAuthorizesConfig) throw new ConfigurationError(`model ${JSON.stringify(model)}: ${CALLER_AUTHORIZED}`);
-      if (model.trim() === "" || !pin.repo.startsWith(TRUSTED_REPO_OWNER)) {
-        throw new ConfigurationError(`model pin ${JSON.stringify(model)} repository ${JSON.stringify(pin.repo)} must belong to ${TRUSTED_REPO_OWNER}`);
+      if (model.trim() === "" || !pin.repo.startsWith(owner)) {
+        throw new ConfigurationError(`model pin ${JSON.stringify(model)} repository ${JSON.stringify(pin.repo)} must belong to ${owner}`);
       }
       try {
         parseReference(pin.repo);
@@ -72,7 +75,7 @@ export class GatewayPolicy {
       }
       resolved.set(model, { repo: pin.repo, verifier: pin.verifier ?? verifier });
     }
-    return new GatewayPolicy(resolved, pinnedOnly, verifier);
+    return new GatewayPolicy(resolved, pinnedOnly, verifier, owner);
   }
 
   /**
@@ -85,8 +88,8 @@ export class GatewayPolicy {
     const pin = this.#pins.get(model);
     if (this.#pinnedOnly && pin === undefined) throw new ConfigurationError(`model ${JSON.stringify(model)} is not pinned`);
     const entry = catalog.get(model);
-    if (!trusted(entry)) {
-      throw new ConfigurationError(`model ${JSON.stringify(model)} has no valid bare ${TRUSTED_REPO_OWNER} repository with replicas in the gateway catalog`);
+    if (!trusted(entry, this.#owner)) {
+      throw new ConfigurationError(`model ${JSON.stringify(model)} has no valid bare ${this.#owner} repository with replicas in the gateway catalog`);
     }
     if (pin !== undefined) {
       const repo = pin.repo.split("@", 1)[0]!;
@@ -106,6 +109,11 @@ export class GatewayPolicy {
     } catch {
       return false;
     }
+  }
+
+  /** The repository owner, ending in a slash. */
+  owner(): string {
+    return this.#owner;
   }
 
   /** The policy a replica of `r` is verified under. */

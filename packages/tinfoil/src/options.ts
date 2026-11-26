@@ -42,6 +42,17 @@ export type TransportMode = "tls" | "ehbp";
 export type VerificationCheck = (verification: Verification) => void | Promise<void>;
 
 /**
+ * Fetches and checks a fresh attestation document from `host`, through the
+ * gateway at `relay`, and resolves to the X25519 HPKE public key that the
+ * one request about to be sent is sealed to. A rejection refuses the
+ * replica, and isn't retried. `signal` isn't the request's: the check must
+ * bound its own duration.
+ *
+ * @experimental FabAI's gateway option; see {@link GatewayOptions.sealCheck}.
+ */
+export type SealCheck = (target: { readonly relay: string; readonly host: string }, signal?: AbortSignal) => Promise<Uint8Array>;
+
+/**
  * The options of one call on a client, such as `ensureVerified` or
  * `reverify`. Any setting a call takes later is a field here rather than a
  * parameter, so callers that pass none are unaffected.
@@ -237,7 +248,8 @@ export interface RouterOptions {
 }
 
 /**
- * Pins a model to `tinfoilsh/name[@tag][@sha256:digest]`.
+ * Pins a model to `tinfoilsh/name[@tag][@sha256:digest]`, or to a repository
+ * of {@link GatewayOptions.repositoryOwner}.
  *
  * @experimental The gateway route is new; this API may change without a major version.
  */
@@ -309,4 +321,24 @@ export interface GatewayOptions {
   readonly fetch?: Fetch;
   /** Aborts the catalog fetch the factory performs before it returns. */
   readonly signal?: AbortSignal;
+
+  // The options below are FabAI's. Unset, the client behaves as upstream's.
+
+  /** The GitHub owner whose bare repositories the catalog and `modelPins` may name; undefined selects `tinfoilsh`. */
+  readonly repositoryOwner?: string;
+  /**
+   * Checks each replica in place of the verifier: `verifier`,
+   * `verificationCheck` and every pin's `verifier` must then be unset. Each
+   * request is sealed to the key of a check of its own: no verification is
+   * cached or shared, even between concurrent requests. A seal check's
+   * result isn't a {@link Verification}, so `ensureVerified` rejects with a
+   * {@link ConfigurationError} and `current` lists no replica.
+   */
+  readonly sealCheck?: SealCheck;
+  /**
+   * Sends no `X-Tinfoil-Cache-Prefix` header, an HMAC of the start of the
+   * prompt, so the gateway sees nothing derived from the prompt. Replicas
+   * of a model are then tried in a random order.
+   */
+  readonly omitCachePrefix?: boolean;
 }

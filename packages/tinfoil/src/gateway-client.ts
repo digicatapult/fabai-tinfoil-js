@@ -12,6 +12,7 @@ import { ConfigurationError } from "./errors.js";
 import { resolveUserCacheSecret } from "./internal/cachesecret.js";
 import { asyncDispose } from "./internal/dispose.js";
 import { fetchCatalogWith } from "./internal/gateway/catalog.js";
+import { checkFabAIOptions } from "./internal/gateway/fabai.js";
 import { GatewayPolicy } from "./internal/gateway/policy.js";
 import { GatewayTransport } from "./internal/gateway/transport.js";
 import { normalizeBaseURL, validateBaseURL } from "./internal/transport/base-url.js";
@@ -52,7 +53,8 @@ export async function createGatewayHTTPClient(options: GatewayOptions, seams: Ga
   // The rules every base URL follows, such as no query string or fragment; HTTPS is already required above.
   validateBaseURL(given);
   const baseURL = normalizeBaseURL(given);
-  const policy = await GatewayPolicy.create(options.modelPins, options.pinnedModelsOnly ?? false, options.verifier);
+  const owner = checkFabAIOptions(options);
+  const policy = await GatewayPolicy.create(options.modelPins, options.pinnedModelsOnly ?? false, options.verifier, owner);
   const secret = await (seams.resolveSecret ?? resolveUserCacheSecret)(options.userCacheSecret);
   const transport = new GatewayTransport({
     baseURL,
@@ -61,6 +63,8 @@ export async function createGatewayHTTPClient(options: GatewayOptions, seams: Ga
     policy,
     verificationCheck: options.verificationCheck,
     secret,
+    sealCheck: options.sealCheck,
+    omitCachePrefix: options.omitCachePrefix,
     catalogFetch: seams.catalogFetch,
     documentFetch: seams.documentFetch,
     clock: seams.clock,

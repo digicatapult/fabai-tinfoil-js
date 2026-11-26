@@ -11,8 +11,8 @@
  * check before it sends. This module is for Node and Bun only; the browser
  * entry maps it to a stub.
  */
-import type { Verification } from "@tinfoilsh/verifier";
 import { AttestationError, ConfigurationError, messageOf, NetworkError } from "../../errors.js";
+import type { Attested } from "../sealcheck.js";
 import type { Fetch } from "../../options.js";
 import { bunOlderThan, isBun, MIN_BUN_FOR_TLS_MODE, tlsUnavailableOnBun } from "../platform.js";
 import { CERT_MISMATCH, isCertificateError } from "./pin-errors.js";
@@ -44,7 +44,7 @@ export function tlsMode(options: TLSOptions = {}): Mode {
   return {
     name: "tls",
     validateRequest: checkTLS,
-    async bind(v: Verification) {
+    async bind(v: Attested) {
       const key = v.tlsPublicKeyFP;
       if (key === undefined) throw new AttestationError('document endorses no "tls" key');
       return isBun() ? bunPinnedFetch(key, options) : nodePinnedFetch(key, options);

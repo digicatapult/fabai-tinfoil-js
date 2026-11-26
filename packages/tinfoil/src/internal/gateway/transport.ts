@@ -12,7 +12,7 @@
  */
 import type { Verification } from "@tinfoilsh/verifier";
 import { AttestationError, ConfigurationError, messageOf, NetworkError, type TinfoilError } from "../../errors.js";
-import type { Catalog, Fetch, ReplicaVerification, VerificationCheck } from "../../options.js";
+import type { Catalog, Fetch, ReplicaVerification, SealCheck, VerificationCheck } from "../../options.js";
 import { closedError } from "../dispose.js";
 import { Enclave, type EnclaveConfig } from "../enclave.js";
 import { checkEHBP, ehbpMode, type EHBPOptions } from "../transport/ehbp.js";
@@ -38,6 +38,10 @@ export interface GatewayTransportConfig {
   readonly verificationCheck?: VerificationCheck;
   /** The resolved client-level cache secret; "" scopes nothing. */
   readonly secret: string;
+  /** Checks each replica in place of the policy's verifier, for one request at a time. */
+  readonly sealCheck?: SealCheck;
+  /** Keeps `X-Tinfoil-Cache-Prefix` off every request. */
+  readonly omitCachePrefix?: boolean;
   /** Seams for tests. */
   readonly catalogFetch?: Fetch;
   readonly documentFetch?: Fetch;
@@ -73,7 +77,10 @@ export class GatewayTransport {
       const read = config.catalog;
       this.#catalog = () => Promise.resolve(read());
     } else {
-      const cache = new CatalogCache((signal) => fetchCatalogWith(config.relay, config.catalogFetch ?? ((input, init) => fetch(input, init)), signal), config.clock);
+      const cache = new CatalogCache(
+        (signal) => fetchCatalogWith(config.relay, config.catalogFetch ?? ((input, init) => fetch(input, init)), signal, config.policy.owner()),
+        config.clock,
+      );
       this.#catalog = (signal) => cache.get(signal);
     }
     this.fetch = (input, init) => this.#send(input, init);
@@ -96,6 +103,7 @@ export class GatewayTransport {
    */
   async ensureVerified(model: string, signal?: AbortSignal): Promise<Verification> {
     if (this.#closed) throw closedError();
+    if (this.#config.sealCheck !== undefined) throw new ConfigurationError("with a seal check, the client holds no verification: the seal check's own result describes the replica");
     const catalog = await this.#catalog(signal);
     const { hosts, replica } = this.#config.policy.resolve(model, catalog);
     let failure: unknown;
@@ -148,6 +156,7 @@ export class GatewayTransport {
     const signal = init?.signal ?? request?.signal;
     const original = init?.body !== undefined ? init.body : request?.body;
     const prepared = await prepare(shape, shape.headers, original, this.#config.secret, undefined, signal);
+    if (this.#config.omitCachePrefix === true) prepared.headers.delete(CACHE_PREFIX_HEADER);
     const model = prepared.headers.get(MODEL_HEADER) ?? "";
     const catalog = await this.#catalog(signal);
     const { hosts, replica } = this.#config.policy.resolve(model, catalog);
@@ -193,7 +202,8 @@ export class GatewayTransport {
   /** `r`'s transport once its replica verifies, so a caller can fall over to another replica before sealing anything to it. */
   async #verified(r: Replica, signal: AbortSignal | undefined): Promise<ReplicaTransport> {
     const rt = await this.#replica(r);
-    await rt.keyed.ensureVerified(signal);
+    // The state, not a Verification, which a seal check has none of.
+    await rt.keyed.state(signal);
     return rt;
   }
 
@@ -227,6 +237,7 @@ export class GatewayTransport {
       pin: { repo: r.ref, project: r.ref },
       verifier: c.policy.verifierFor(r),
       verificationCheck: c.verificationCheck,
+      sealCheck: c.sealCheck,
       fetch: c.documentFetch,
       clock: c.clock,
       nonce: c.nonce,
